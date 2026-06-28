@@ -55,6 +55,14 @@ running cluster keep working; renaming them would be a breaking change, not an S
 - `nagelfluh.remoteName` — the package.json key a plugin uses to declare its MF remote name.
 - `NAGELFLUH_SHARED_VERSIONS` — env var the host injects with its shared-singleton versions.
 
+## Documentation
+
+- **[Plugin Author Guide](docs/README.md)** — overview of the plugin system and delivery mechanisms
+- **[Authoring a plugin](docs/authoring.md)** — file structure, `package.json`, and the `src/index.js` entry point
+- **[Frontend hooks](docs/frontend-hooks.md)** — complete reference of frontend hook points (`widgets`, `dataset_types`, `layer_types`, …)
+- **[Backend hooks](docs/backend-hooks.md)** — complete reference of backend Python entry-point hooks
+- **[Distributing & building](docs/distributing.md)** — publishing and serving plugins
+
 ## Tests
 
 ```bash
