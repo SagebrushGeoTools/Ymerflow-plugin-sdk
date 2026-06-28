@@ -1,0 +1,21 @@
+{
+  "name": "ymerflow-plugin-sdk",
+  "version": "1.0.0",
+  "description": "SDK for authoring Ymerflow frontend plugins: registerHook/hooks/useHook + the Module-Federation Vite preset that pins shared singletons to the host's versions.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./vite-preset": "./vite-preset.js"
+  },
+  "files": [
+    "index.js",
+    "vite-preset.js",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "license": "MIT"
+}
