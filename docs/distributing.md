@@ -45,14 +45,17 @@ at install time via a `build_py` command that calls the shared routine and ships
 package data:
 
 ```python
+import os
 from setuptools import setup
 from setuptools.command.build_py import build_py
-from ymerflow_plugin_build import build_frontend
 
 class BuildWithFrontend(build_py):
     def run(self):
-        build_frontend(npm_name='@skytem/nagelfluh-plugin', npm_version='1.2.3',
-                       out_dir='my_backend_plugin/frontend_dist')
+        # Guard lets a metadata-only install skip the frontend build (see NAGELFLUH_SKIP_FRONTEND_BUILD below).
+        if os.environ.get('NAGELFLUH_SKIP_FRONTEND_BUILD') != '1':
+            from ymerflow_plugin_build import build_frontend  # build dep — see pyproject.toml
+            build_frontend(npm_name='@skytem/nagelfluh-plugin', npm_version='1.2.3',
+                           out_dir='my_backend_plugin/frontend_dist')
         super().run()
 
 setup(
@@ -72,3 +75,34 @@ The `nagelfluh.hooks` entry points are the [backend hooks](backend-hooks.md) the
 The running server never runs npm — the built output ships in the package and is content-addressed
 and served from the identical `/plugin-assets/{content_hash}/…` path, so the frontend loads both
 kinds indistinguishably.
+
+### `ymerflow_plugin_build` is a *build* dependency — declare it in `pyproject.toml`
+
+Because `setup.py` **imports and calls** `ymerflow_plugin_build` while building, it is a build-time
+dependency, not a runtime one (the running server never imports it). Modern pip builds every package
+in an isolated environment (PEP 517/518) containing **only** the packages listed under
+`[build-system].requires`. If `ymerflow-plugin-build` is not listed there, the build environment has
+just `setuptools`+`wheel`, the `from ymerflow_plugin_build import build_frontend` in `setup.py`
+raises `ImportError`, and the build fails.
+
+So ship a `pyproject.toml` alongside `setup.py`:
+
+```toml
+[build-system]
+requires = [
+    "setuptools>=61",
+    "wheel",
+    "ymerflow-plugin-build @ git+https://github.com/SagebrushGeoTools/Ymerflow-plugin-sdk.git",
+]
+build-backend = "setuptools.build_meta"
+```
+
+Put `ymerflow-plugin-build` here, **not** in `setup.py`'s `install_requires` — it is only needed to
+build, and listing it as a runtime requirement would force every install target to pull the SDK for
+no reason. With this in place, a plain `pip install` / `pip install -e` builds the frontend with no
+extra flags. (The alternative — `pip install --no-build-isolation`, relying on the SDK already being
+present in the ambient environment — is fragile and should not be required.)
+
+For a metadata-only install that skips the frontend build entirely (e.g. on a machine without npm),
+set `NAGELFLUH_SKIP_FRONTEND_BUILD=1`; the `build_py` override checks it before invoking the build,
+so neither npm nor the build dependency is consulted.
