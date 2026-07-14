@@ -15,11 +15,24 @@ entry_points={
 }
 ```
 
-The hook dispatcher (`backend/hooks.py`) collects all callables registered under a given name,
-calls each in turn, and:
-- For `hooks.run.*` — concatenates non-`None` return values into a single list
-- For `hooks.run_async.*` — same, but awaits coroutines
-- Raises the last exception if any hook raised (chained via `__context__`)
+The hook dispatcher (`backend/hooks.py`) collects all callables registered under a given name
+(sorted by distribution name, so fan-out order is deterministic) and dispatches via one of three
+runner flavours:
+
+- **`hooks.run.*`** — calls each hook in turn, concatenates non-`None`/non-empty return values
+  into a single list. Raises the last exception if any hook raised (chained via `__context__`
+  onto earlier ones).
+- **`hooks.run_async.*`** — same as `run`, but awaits coroutines returned by async hook functions.
+- **`hooks.run_first.*`** — calls `hooks.run_first.<name>(default, *args, **kwargs)`. Calls each
+  hook in turn and returns the first **non-`None`** result; if none answer, returns `default`.
+  Unlike `run`/`run_async`, disagreement between plugins is *not* an error — first-registered
+  (by dist-name sort order) silently wins. Only used where exactly one answer is needed (e.g.
+  picking a single storage backend for a new project).
+
+There's also `hooks.any_registered(name)`, a plain function (not a namespace) that returns whether
+*any* plugin registers a given hook name at all — used to distinguish "no plugins registered" from
+"plugins registered but all returned nothing" for callers that only want a fallback in the former
+case (e.g. `select_clusters`, below).
 
 > Source-path references below point at the **host application** repository (see the
 > [overview](README.md) for context).
@@ -207,3 +220,201 @@ async def job_completed(db, process, process_version, runtime_seconds, status):
         account.credits -= cost
         # transaction is committed by the caller
 ```
+
+## Cluster hooks
+
+### `select_clusters`
+
+Restricts which Kubernetes clusters a user may run jobs on. If **no** plugin registers this hook,
+every active cluster is allowed (checked via `hooks.any_registered`, not by an empty result — a
+registered hook that legitimately returns an empty set means "no clusters allowed", not "fall back
+to all").
+
+- **Caller:** `backend/models/cluster.py` `get_allowed_clusters()` — `hooks.run.select_clusters(db, user, project_id, resource_requests)`
+- **Runner:** `run` (synchronous)
+- **Parameters:**
+  - `db` (`sqlalchemy.ext.asyncio.AsyncSession`) — active database session
+  - `user` (`backend.models.User`) — the requesting user
+  - `project_id` (`str | None`) — project context, if any
+  - `resource_requests` (`dict | None`) — `{"cpu": ..., "memory": ...}` if the caller specified resource hints, else `None`
+- **Returns:** `list[str]` — cluster ids this plugin allows; the union across all registered plugins is the final allowed set
+
+```python
+def select_clusters(db, user, project_id, resource_requests):
+    if user.billing_account and user.billing_account.plan == "premium":
+        return ["gpu-cluster-1", "gpu-cluster-2"]
+    return ["shared-cluster"]
+```
+
+### `cluster_provider_handlers`
+
+Registers `ClusterProvider` implementations for `Cluster.cluster_type` values (e.g.
+`same-as-backend`, `kubeconfig`, `minikube`). Core registers its own built-in providers through
+this exact same hook (see the host's root `setup.py`) — a plugin adding a new cluster type (e.g.
+GKE) uses the identical channel core does, with no "core is special" path.
+
+- **Caller:** `backend/services/cluster_providers/__init__.py` `get_cluster_provider()` — `hooks.run.cluster_provider_handlers()`
+- **Runner:** `run` (synchronous)
+- **Parameters:** none
+- **Returns:** `list[tuple[str, type]]` — `(cluster_type, ClusterProviderSubclass)` pairs. A duplicate `cluster_type` across plugins raises `ValueError`.
+
+#### The `Cluster` row
+
+Each admin-configured cluster is a `Cluster` row (`backend/models/cluster.py`). The fields a
+`ClusterProvider` cares about:
+- `cluster_type` (`str`) — the discriminator dispatched to `get_cluster_provider()`; this is the key you register under
+- `provider_config` (`dict`, JSON column) — opaque, provider-specific config (e.g. a parsed kubeconfig dict for `KubeconfigClusterProvider`); the admin UI's matching [`cluster_provider_forms`](frontend-hooks.md#cluster_provider_forms) entry is what edits this
+- `namespace` (`str`) — the Kubernetes namespace jobs for this cluster should run in
+
+#### `ClusterProvider` base class
+
+`backend.services.cluster_providers.ClusterProvider` — subclass this and register an instance's
+class via `cluster_provider_handlers`.
+
+- `self_service_registration` (class attribute, default `False`) — set `True` for providers that
+  can't complete registration synchronously in the admin "Add Cluster" dialog (the config is
+  filled in later by something running on the target host, e.g. a setup script the admin
+  copy-pastes). See `docs/plans/minikube-cluster-registration-ux.md` in the host repo for the
+  out-of-band registration flow this enables (`minikube` is the only built-in provider that sets
+  this).
+- `connect(provider_config: dict, namespace: str) -> K8sClient` — **required**, no default.
+  Synchronous — just constructs and returns a `K8sClient`, it does not itself open a connection
+  (`K8sClient` lazily initializes on first API call). This is the one method every provider must
+  implement; everything else is generic dispatch built on top of the client it returns.
+- `test_connection(provider_config: dict) -> None` (async) — optional; default implementation
+  calls `connect()` then does a timeout-bounded `list_namespace` call to verify reachability. Raise
+  a clear exception on failure. Override when a cheaper or more specific check makes sense (e.g.
+  validating a token before even attempting a network call).
+
+```python
+from backend.services.cluster_providers import ClusterProvider
+from backend.services.k8s_client import K8sClient
+
+class GkeClusterProvider(ClusterProvider):
+    def connect(self, provider_config, namespace):
+        # provider_config is whatever your cluster_provider_forms component wrote to
+        # Cluster.provider_config — e.g. {"kubeconfig": {...}} built from a GCP service account
+        return K8sClient(namespace=namespace, kubeconfig=provider_config["kubeconfig"])
+
+def cluster_provider_handlers():
+    return [("gke", GkeClusterProvider)]
+```
+
+This mirrors the built-in `KubeconfigClusterProvider`
+(`backend/services/cluster_providers/kubeconfig.py`) almost exactly — most new cluster types are
+really just "resolve a kubeconfig dict some other way," so `connect()` can often just delegate to
+`K8sClient(namespace=namespace, kubeconfig=<resolved dict>)`.
+
+#### `K8sClient`
+
+`backend.services.k8s_client.K8sClient` is what every `ClusterProvider.connect()` returns — it's
+the only class a plugin needs to *return*, never subclass. Construct it as
+`K8sClient(namespace=namespace, kubeconfig=kubeconfig_dict_or_None)`:
+- `kubeconfig=None` — auto-detect (in-cluster config when running inside K8s, else the local
+  kubeconfig); this is what `SameAsBackendClusterProvider` uses
+- `kubeconfig={...}` — an already-parsed kubeconfig dict, loaded via
+  `kubernetes_asyncio.config.load_kube_config_from_dict`
+
+It lazily initializes (`_ensure_initialized()`) on first API call, exposing `core_api`
+(`CoreV1Api`) and `batch_api` (`BatchV1Api`) plus higher-level async methods used by the job
+orchestrator: `create_job`, `delete_job`, `get_job_status`, `get_pod_for_job`,
+`stream_pod_logs`/`get_pod_logs`, `get_pod_events`/`get_job_events`, `get_job_error_status`/
+`get_pod_error_status`, `get_cluster_queue_limits` (reads a Kueue `ClusterQueue`'s CPU/memory
+quota), and `watch_job` (an async generator yielding job status updates until a terminal state).
+A plugin's `ClusterProvider` never needs to call these itself — it only needs to construct and
+return the client; the host calls these methods on it.
+
+## Storage hooks
+
+### `select_storage`
+
+Picks which `StorageBackend` a newly created project provisions its bucket on. Unlike
+`select_clusters` (a set of allowed options), this hook picks exactly **one** answer, so it uses
+the `run_first` runner: the first plugin to return a non-`None` id wins, and if none do, the
+platform default is used.
+
+- **Caller:** `backend/routers/projects.py` project-creation handler — `hooks.run_first.select_storage(default_storage_backend_id, db, user, project)`
+- **Runner:** `run_first` (returns first non-`None` result, else the `default` argument)
+- **Parameters:**
+  - `default` (`str`) — the platform's configured default storage backend id (passed positionally before the rest)
+  - `db` (`sqlalchemy.ext.asyncio.AsyncSession`) — active database session
+  - `user` (`backend.models.User`) — the user creating the project
+  - `project` (`backend.models.Project`) — the new project (already flushed, has an `id`, not yet committed)
+- **Returns:** `str | None` — a `StorageBackend.id`, or `None` to defer to the next plugin / the default
+
+```python
+def select_storage(default, db, user, project):
+    if user.billing_account and user.billing_account.plan == "enterprise":
+        return "dedicated-backend-id"
+    return None  # defer to the platform default
+```
+
+### `storage_protocol_handlers`
+
+Registers `StorageProtocolHandler` implementations for `StorageBackend.protocol` values (e.g.
+`minio`, `gcs`, `s3`). Core registers its own built-in handlers through this exact same hook (see
+the host's root `setup.py`) — a plugin adding a new protocol (e.g. Azure) uses the identical
+channel core does, with no "core is special" path.
+
+- **Caller:** `backend/services/storage_protocols/__init__.py` `get_protocol_handler()` — `hooks.run.storage_protocol_handlers()`
+- **Runner:** `run` (synchronous)
+- **Parameters:** none
+- **Returns:** `list[tuple[str, type]]` — `(protocol, StorageProtocolHandlerSubclass)` pairs. A duplicate `protocol` across plugins raises `ValueError`.
+
+#### The `StorageBackend` row
+
+Each admin-configured storage backend is a `StorageBackend` row (`backend/models/storage_backend.py`).
+The fields a `StorageProtocolHandler` cares about:
+- `protocol` (`str`) — the discriminator dispatched to `get_protocol_handler()`; this is the key you register under
+- `endpoint` (`str | None`) — service URL (e.g. a MinIO endpoint); typically empty for real cloud protocols that resolve endpoints implicitly (GCS/S3 SDKs)
+- `bucket_prefix` (`str`) — prefix used to derive a per-project bucket/container name
+- `credential_strategy` (`str`, default `static-key`) — which `CredentialStrategy` (`backend/services/storage_credentials.py`) mints project credentials; `static-key` persists what `provision()` returns, other strategies call `mint()` per use
+- `config` (`dict`, JSON column) — opaque, protocol-specific connection config (e.g. MinIO admin access/secret key); the admin UI's matching [`storage_protocol_forms`](frontend-hooks.md#storage_protocol_forms) entry is what edits this
+
+#### `StorageProtocolHandler` base class
+
+`backend.services.storage_protocols.StorageProtocolHandler` — subclass this and register an
+instance's class via `storage_protocol_handlers`. All three methods are **required** (no
+defaults — protocols are too different from each other for a shared implementation, unlike
+`ClusterProvider.test_connection`):
+
+- `provision(project, backend) -> dict` (sync) — one-time setup at project creation: bucket /
+  service-account / policy creation. Returns credentials to persist for `static-key` use, or `{}`
+  if this protocol never persists a long-lived credential.
+- `mint(project, backend) -> dict` (sync) — mint a fresh credential on demand:
+  `{"credentials": {...}, "expires_at": datetime | None}`. Only called for backends using a
+  non-`static-key` credential strategy.
+- `test_connection(backend) -> None` (async) — validate connectivity/credentials only, no side
+  effects; safe to call repeatedly from the admin UI before any project exists to provision for.
+
+```python
+from backend.services.storage_protocols import StorageProtocolHandler
+
+class AzureProtocolHandler(StorageProtocolHandler):
+    def provision(self, project, backend) -> dict:
+        # backend.endpoint / backend.bucket_prefix / backend.config are this row's fields —
+        # read connection config from backend.config, never from global settings, so every
+        # admin-added backend of this protocol is provisioned identically
+        return create_container_and_credentials(
+            project.id, backend.bucket_prefix, backend.config["account_key"],
+        )
+
+    def mint(self, project, backend) -> dict:
+        raise NotImplementedError("short-lived Azure SAS token minting not implemented yet")
+
+    async def test_connection(self, backend) -> None:
+        client = get_azure_client(backend.endpoint, backend.config["account_key"])
+        await asyncio.to_thread(lambda: client.list_containers())
+
+def storage_protocol_handlers():
+    return [("azure", AzureProtocolHandler)]
+```
+
+This mirrors the built-in `MinioProtocolHandler` (`backend/services/storage_protocols/minio.py`)
+almost exactly — reading connection config from `backend.config` (never from global settings) is
+the load-bearing convention: it's what lets an admin register multiple backends of the same
+protocol (e.g. two separate MinIO clusters) and have each provision independently.
+
+There is no shared "storage client" class analogous to `K8sClient` — each protocol handler talks
+to its own SDK directly (e.g. `minio.Minio`, `google.cloud.storage`) inside `provision()`/`mint()`/
+`test_connection()`; only the four-method `StorageProtocolHandler` shape is standardized.

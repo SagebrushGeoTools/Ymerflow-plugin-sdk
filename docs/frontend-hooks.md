@@ -132,18 +132,38 @@ registerHook('app_providers', () => [
 
 ### `account_tabs`
 
-Add extra tabs to the Account page.
+Add extra tabs to the Account page. Both `account_tabs` and `admin_tabs` (below) are consumed by
+the same generic `TabbedPage.jsx` component, which binds the active tab to a URL path segment
+(`{basePath}/:tab`).
 
 - **Runner:** `run`
-- **Consumed by:** `AccountPage.jsx`
-- **Callback returns:** `Array<{ id: string, title: string, content: ReactElement }>`
-  - `id` — unique tab identifier
+- **Consumed by:** `TabbedPage.jsx` (rendered by `AccountPage.jsx` with `basePath="/account"`)
+- **Callback returns:** `Array<{ key: string, title: string, Component: ReactComponent }>`
+  - `key` — unique tab identifier (used as the URL path segment and as the React key)
   - `title` — tab label shown in the tab bar
-  - `content` — React element rendered as the tab body
+  - `Component` — component rendered as the tab body; receives whatever `tabProps` the host page passes (`AccountPage` passes `accountData`/`onTransactionClick`-style props)
 
 ```js
 registerHook('account_tabs', () => [
-  { id: 'my-tab', title: 'My Tab', content: <MyAccountSection /> },
+  { key: 'my-tab', title: 'My Tab', Component: MyAccountSection },
+])
+```
+
+### `admin_tabs`
+
+Add extra tabs to the Admin page (visible only to admins — `AdminPage.jsx` gates access before
+rendering). Same shape and same `TabbedPage.jsx` consumer as `account_tabs`.
+
+- **Runner:** `run`
+- **Consumed by:** `TabbedPage.jsx` (rendered by `AdminPage.jsx` with `basePath="/admin"`)
+- **Callback returns:** `Array<{ key: string, title: string, Component: ReactComponent }>`
+  - `key` — unique tab identifier (used as the URL path segment and as the React key)
+  - `title` — tab label shown in the tab bar
+  - `Component` — component rendered as the tab body (no extra props are passed by `AdminPage`)
+
+```js
+registerHook('admin_tabs', () => [
+  { key: 'my-admin-tab', title: 'My Settings', Component: MyAdminPanel },
 ])
 ```
 
@@ -174,6 +194,68 @@ Add items to the user dropdown menu in the menu bar.
 ```js
 registerHook('user_menu_extra_items', () => [
   <li key="my-item"><button onClick={...}>My Action</button></li>,
+])
+```
+
+### `fullscreen_pages`
+
+Register a full-screen page rendered with **no app chrome** (no menu bar, no layout) when the
+current URL path starts with a given prefix — for landing pages reached via an emailed link (e.g.
+accepting an invite) that shouldn't show the normal app shell. Checked before the authenticated
+app renders; the path is also remembered across a login redirect (via `sessionStorage`) so a
+fullscreen page survives an intervening login.
+
+- **Runner:** `run`
+- **Consumed by:** `App.jsx` — `hooks.run.fullscreen_pages()`, matched against `location.pathname` with `.startsWith(p.path)`
+- **Callback returns:** `Array<{ path: string, Component: ReactComponent }>`
+  - `path` — URL path prefix to match (e.g. `/billing/invite/`)
+  - `Component` — page component rendered with no props, replacing the entire app shell
+
+```js
+registerHook('fullscreen_pages', () => [
+  { path: '/my-plugin/invite/', Component: MyInviteLandingPage },
+])
+```
+
+### `cluster_provider_forms`
+
+Provide the connection-config form shown in the admin Clusters panel for a given
+`Cluster.cluster_type`. Core registers its own built-in forms (`same-as-backend`, `kubeconfig`,
+`minikube`) through this exact same hook — a plugin adding a new cluster type pairs a
+`cluster_provider_forms` entry here with a backend `cluster_provider_handlers` registration (see
+[backend hooks](backend-hooks.md#cluster_provider_handlers)) for the matching `type`.
+
+- **Runner:** `run`
+- **Consumed by:** `ClustersAdminPanel.jsx` — `hooks.run.cluster_provider_forms()`
+- **Callback returns:** `Array<{ type: string, title: string, Component: ReactComponent }>`
+  - `type` — must match the `cluster_type` string the backend `ClusterProvider` is registered under
+  - `title` — human-readable label shown in the cluster-type dropdown
+  - `Component` — form component for editing this cluster type's `provider_config`
+
+```js
+registerHook('cluster_provider_forms', () => [
+  { type: 'gke', title: 'Google Kubernetes Engine', Component: GkeClusterForm },
+])
+```
+
+### `storage_protocol_forms`
+
+Provide the connection-config form shown in the admin Storage Backends panel for a given
+`StorageBackend.protocol`. Core registers its own built-in forms (`minio`, `gcs`, `s3`) through
+this exact same hook — a plugin adding a new protocol pairs a `storage_protocol_forms` entry here
+with a backend `storage_protocol_handlers` registration (see
+[backend hooks](backend-hooks.md#storage_protocol_handlers)) for the matching `type`.
+
+- **Runner:** `run`
+- **Consumed by:** `StorageBackendsAdminPanel.jsx` — `hooks.run.storage_protocol_forms()`
+- **Callback returns:** `Array<{ type: string, title: string, Component: ReactComponent }>`
+  - `type` — must match the `protocol` string the backend `StorageProtocolHandler` is registered under
+  - `title` — human-readable label shown in the protocol dropdown
+  - `Component` — form component for editing this protocol's connection config
+
+```js
+registerHook('storage_protocol_forms', () => [
+  { type: 'azure', title: 'Azure Blob Storage', Component: AzureStorageForm },
 ])
 ```
 
