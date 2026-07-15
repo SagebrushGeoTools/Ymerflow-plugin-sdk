@@ -285,6 +285,8 @@ class via `cluster_provider_handlers`.
   calls `connect()` then does a timeout-bounded `list_namespace` call to verify reachability. Raise
   a clear exception on failure. Override when a cheaper or more specific check makes sense (e.g.
   validating a token before even attempting a network call).
+- `bootstrap(provider_config: dict) -> dict` (sync) — **required**, no default. See [The
+  `bootstrap()` provisioning flow](#the-bootstrap-provisioning-flow) below.
 
 ```python
 from backend.services.cluster_providers import ClusterProvider
@@ -295,6 +297,14 @@ class GkeClusterProvider(ClusterProvider):
         # provider_config is whatever your cluster_provider_forms component wrote to
         # Cluster.provider_config — e.g. {"kubeconfig": {...}} built from a GCP service account
         return K8sClient(namespace=namespace, kubeconfig=provider_config["kubeconfig"])
+
+    def bootstrap(self, provider_config: dict) -> dict:
+        # Most providers never need this — return provider_config unchanged, exactly like every
+        # core-provided provider does. Only implement live provisioning here if config.env-driven
+        # setup (via nagelfluh-bootstrap-provision) should do more than just persist the given
+        # config as-is — e.g. actually creating a GKE cluster here and folding its resulting
+        # kubeconfig into the returned provider_config.
+        return provider_config
 
 def cluster_provider_handlers():
     return [("gke", GkeClusterProvider)]
@@ -317,12 +327,25 @@ the only class a plugin needs to *return*, never subclass. Construct it as
 
 It lazily initializes (`_ensure_initialized()`) on first API call, exposing `core_api`
 (`CoreV1Api`) and `batch_api` (`BatchV1Api`) plus higher-level async methods used by the job
-orchestrator: `create_job`, `delete_job`, `get_job_status`, `get_pod_for_job`,
+orchestrator: `create_job`, `create_secret`, `delete_job`, `get_job_status`, `get_pod_for_job`,
 `stream_pod_logs`/`get_pod_logs`, `get_pod_events`/`get_job_events`, `get_job_error_status`/
 `get_pod_error_status`, `get_cluster_queue_limits` (reads a Kueue `ClusterQueue`'s CPU/memory
 quota), and `watch_job` (an async generator yielding job status updates until a terminal state).
 A plugin's `ClusterProvider` never needs to call these itself — it only needs to construct and
 return the client; the host calls these methods on it.
+
+#### Job-readiness provisioning is automatic
+
+Once a `Cluster` becomes active (self-service registration callback, direct admin creation, or a
+config.env-driven `bootstrap()`-seeded default cluster), the host calls
+`backend.services.cluster_job_provisioning.ensure_cluster_job_ready(k8s_client, namespace)` against
+it — installing Kueue (if not already present), sizing and applying a `ResourceFlavor`/
+`ClusterQueue`/`LocalQueue` from the cluster's real node capacity, and applying the backend's
+job-running RBAC. This is generic, pure-`kubernetes_asyncio` logic that works against **any**
+`K8sClient`, regardless of `cluster_type` — a plugin's `ClusterProvider` gets this for free just by
+returning a working `K8sClient` from `connect()`; it never needs to install Kueue or apply RBAC
+itself. See the host repo's `docs/architecture/registry.md` and
+`docs/plans/done/registry-backend-hooks.md` for the full design.
 
 ## Storage hooks
 
@@ -374,7 +397,7 @@ The fields a `StorageProtocolHandler` cares about:
 #### `StorageProtocolHandler` base class
 
 `backend.services.storage_protocols.StorageProtocolHandler` — subclass this and register an
-instance's class via `storage_protocol_handlers`. All three methods are **required** (no
+instance's class via `storage_protocol_handlers`. All four methods are **required** (no
 defaults — protocols are too different from each other for a shared implementation, unlike
 `ClusterProvider.test_connection`):
 
@@ -386,6 +409,8 @@ defaults — protocols are too different from each other for a shared implementa
   non-`static-key` credential strategy.
 - `test_connection(backend) -> None` (async) — validate connectivity/credentials only, no side
   effects; safe to call repeatedly from the admin UI before any project exists to provision for.
+- `bootstrap(config: dict) -> dict` (sync) — see [The `bootstrap()` provisioning
+  flow](#the-bootstrap-provisioning-flow) below.
 
 ```python
 from backend.services.storage_protocols import StorageProtocolHandler
@@ -406,6 +431,14 @@ class AzureProtocolHandler(StorageProtocolHandler):
         client = get_azure_client(backend.endpoint, backend.config["account_key"])
         await asyncio.to_thread(lambda: client.list_containers())
 
+    def bootstrap(self, config: dict) -> dict:
+        # Most protocols never need this — return config unchanged, exactly like every
+        # core-provided handler does. Only implement live provisioning here if config.env-driven
+        # setup (via nagelfluh-bootstrap-provision) should do more than just persist the given
+        # config as-is — e.g. creating a storage account here and folding its keys into the
+        # returned config.
+        return config
+
 def storage_protocol_handlers():
     return [("azure", AzureProtocolHandler)]
 ```
@@ -417,4 +450,136 @@ protocol (e.g. two separate MinIO clusters) and have each provision independentl
 
 There is no shared "storage client" class analogous to `K8sClient` — each protocol handler talks
 to its own SDK directly (e.g. `minio.Minio`, `google.cloud.storage`) inside `provision()`/`mint()`/
-`test_connection()`; only the four-method `StorageProtocolHandler` shape is standardized.
+`test_connection()`; only the `StorageProtocolHandler` method shape is standardized.
+
+## Registry hooks
+
+### `registry_protocol_handlers`
+
+Registers `RegistryProtocolHandler` implementations for `RegistryBackend.protocol` values (e.g.
+`docker-v2`, `gar`). This is the third pluggable-backend axis, mirroring `storage_protocol_handlers`
+and `cluster_provider_handlers` exactly — one active `RegistryBackend` row is used app-wide (there
+is only ever one registry, not one per project or per cluster). Core registers its own built-in
+handler (`docker-v2`, wrapping a self-hosted Docker Registry v2 instance) through this exact same
+hook (see the host's root `setup.py`) — a plugin adding a new protocol (e.g. Google Artifact
+Registry) uses the identical channel core does, with no "core is special" path.
+
+- **Caller:** `backend/services/registry_protocols/__init__.py` `get_registry_protocol_handler()` — `hooks.run.registry_protocol_handlers()`
+- **Runner:** `run` (synchronous)
+- **Parameters:** none
+- **Returns:** `list[tuple[str, type]]` — `(protocol, RegistryProtocolHandlerSubclass)` pairs. A duplicate `protocol` across plugins raises `ValueError`.
+
+#### The `RegistryBackend` row
+
+The single, app-wide registry configuration is a `RegistryBackend` row
+(`backend/models/registry_backend.py`). The fields a `RegistryProtocolHandler` cares about:
+- `protocol` (`str`) — the discriminator dispatched to `get_registry_protocol_handler()`; this is the key you register under
+- `config` (`dict`, JSON column) — opaque, protocol-specific connection config (e.g. `docker-v2`'s `user`/`password`/`host`/`port`); there is no admin-UI form hook for this yet (unlike `storage_protocol_forms`/`cluster_provider_forms`) — a plugin protocol's config is currently set via `config.env`'s `REGISTRY_PROTOCOL`/`REGISTRY_CONFIG_JSON` (see [The `bootstrap()` provisioning flow](#the-bootstrap-provisioning-flow) below) rather than through the admin UI
+
+#### `RegistryProtocolHandler` base class
+
+`backend.services.registry_protocols.RegistryProtocolHandler` — subclass this and register an
+instance's class via `registry_protocol_handlers`. All five methods are **required** (no defaults —
+same rationale as `StorageProtocolHandler`: protocols are too different from each other for a
+shared implementation):
+
+- `image_url(config: dict, repository: str, tag: str) -> str` (sync) — the single place address
+  *shape* is decided (mirrors `StorageProtocolHandler.storage_base_url`). `docker-v2` returns
+  `host:port/repository:tag`.
+- `pull_credentials(config: dict) -> dict` (async) — resolve a pod image-pull credential. Returns
+  `{"username": str, "password": str, "expires_at": datetime | None}`. Called by the host **per
+  Job**, at Job-creation time, not once and cached — the host mints an ephemeral, Job-scoped
+  `kubernetes.io/dockerconfigjson` Secret from this result and attaches it as that Job's
+  `imagePullSecrets`, owned by the Job so it's garbage-collected alongside it. `expires_at=None`
+  means "static credential, never refresh" (what `docker-v2` returns); a protocol with genuinely
+  short-lived pull tokens (e.g. a GCP access token for GAR) returns its real expiry here — the host
+  doesn't currently re-mint mid-Job on expiry, since `pull_credentials()` is only ever called once,
+  at Job-creation time, so an `expires_at` shorter than a Job's expected runtime isn't useful yet.
+- `configure_push_auth(config: dict) -> None` (sync) — perform whatever local `docker login` /
+  credential-helper setup push-side tooling needs before a `docker push`. Called by the host-side
+  `backend/bin/nagelfluh-registry-push <repository> <tag>` entry point, which
+  `docker/build.sh`-equivalent tooling shells out to instead of hardcoding any protocol's push
+  mechanics itself.
+- `test_connection(config: dict) -> None` (async) — raise a clear exception if this config can't
+  actually reach/authenticate against a registry. No default implementation, same rationale as
+  `StorageProtocolHandler.test_connection`.
+- `bootstrap(config: dict) -> dict` (sync) — see [The `bootstrap()` provisioning
+  flow](#the-bootstrap-provisioning-flow) below.
+
+```python
+from backend.services.registry_protocols import RegistryProtocolHandler
+
+class GarProtocolHandler(RegistryProtocolHandler):
+    def image_url(self, config: dict, repository: str, tag: str) -> str:
+        # config is this RegistryBackend row's own config dict — e.g. {"location": "us",
+        # "project": "my-gcp-project", "repository": "nagelfluh"}
+        return f"{config['location']}-docker.pkg.dev/{config['project']}/{config['repository']}/{repository}:{tag}"
+
+    async def pull_credentials(self, config: dict) -> dict:
+        token, expires_at = await mint_gcp_access_token(config)
+        return {"username": "oauth2accesstoken", "password": token, "expires_at": expires_at}
+
+    def configure_push_auth(self, config: dict) -> None:
+        run_gcloud_auth_configure_docker(config)
+
+    async def test_connection(self, config: dict) -> None:
+        await asyncio.to_thread(lambda: verify_gar_repository_reachable(config))
+
+    def bootstrap(self, config: dict) -> dict:
+        # Live-provisioning example (unlike the passthrough examples elsewhere in this doc):
+        # config.env supplied just enough to know WHICH GAR repository to use; this creates it
+        # if it doesn't exist yet and returns the enriched config nagelfluh-bootstrap-provision
+        # persists onto the RegistryBackend row.
+        ensure_gar_repository_exists(config)
+        return config
+
+def registry_protocol_handlers():
+    return [("gar", GarProtocolHandler)]
+```
+
+There is no shared "registry client" class analogous to `K8sClient` — each protocol handler talks
+to its own SDK/CLI directly inside its five methods; only the `RegistryProtocolHandler` method
+shape is standardized. Unlike `docker-v2` (which keeps CA-pinning logic for its self-signed
+certificate internal to its own handler), the ABC itself has **no concept of CA pinning or any
+other TLS-trust mechanism** — a protocol with a normally CA-issued cert (like a real managed
+registry) simply never implements anything resembling it.
+
+## The `bootstrap()` provisioning flow
+
+All three pluggable-backend axes — `RegistryProtocolHandler`, `StorageProtocolHandler`, and
+`ClusterProvider` — share one more method beyond their protocol-specific operations:
+`bootstrap(config: dict) -> dict` (storage/registry call the parameter `config`; `ClusterProvider`
+calls it `provider_config` — same shape, different name to match each axis's existing
+terminology). Every **core-provided** protocol/provider (`docker-v2`, `minio`, `s3`,
+`same-as-backend`, `kubeconfig`, `minikube`) implements this as a pure passthrough
+(`return config`) — there is nothing for core to provision, since core's registry/storage/cluster
+are all stood up by separate setup scripts, not by this hook. A plugin protocol is free to do real
+work here instead: provision a fresh cloud resource, mint a first credential, or anything else
+config.env-driven setup should trigger automatically.
+
+**How it gets invoked.** The host application's `backend/bin/nagelfluh-bootstrap-provision` (a
+standalone script, not a FastAPI route) is the one and only caller. For each axis, if the operator
+set a matching pair of environment variables in `config.env` —
+`REGISTRY_PROTOCOL`/`REGISTRY_CONFIG_JSON`, `STORAGE_PROTOCOL`/`STORAGE_CONFIG_JSON`, or
+`CLUSTER_TYPE`/`CLUSTER_CONFIG_JSON` — the script parses `<AXIS>_CONFIG_JSON`, resolves your
+handler/provider via the same `get_registry_protocol_handler()`/`get_protocol_handler()`/
+`get_cluster_provider()` lookups described above, and calls `.bootstrap(parsed_config)`. The
+enriched `{protocol, config}` result it returns is what ends up seeded onto the corresponding
+default `RegistryBackend`/`StorageBackend`/`Cluster` row — in development this happens host-side,
+right before migrations run; in a Kubernetes deployment the enriched result is folded into the
+backend's config Secret/ConfigMap and consumed by the same generic Alembic seed migrations that run
+inside the cluster. Your plugin's `bootstrap()` is never called from anywhere else, and is never
+required to exist beyond the default `NotImplementedError` if you have nothing to provision — an
+axis whose environment variable pair isn't set is skipped entirely, which is what keeps every
+existing deployment (that never touches these variables) unaffected.
+
+**What NOT to do in `bootstrap()`.** For the `ClusterProvider` axis specifically: your
+`bootstrap()` should only ever produce/enrich the credential (e.g. `provider_config`) — it must
+**not** itself call `ensure_cluster_job_ready()` (see [Job-readiness provisioning is
+automatic](#job-readiness-provisioning-is-automatic) above). The host is responsible for calling
+that, once, at the one place a `bootstrap()`-seeded default `Cluster` row's config actually becomes
+active — duplicating that call inside your own `bootstrap()` would just make it run twice for no
+benefit.
+
+See the host repo's `docs/plans/done/registry-backend-hooks.md` for the full design rationale
+behind this mechanism.
