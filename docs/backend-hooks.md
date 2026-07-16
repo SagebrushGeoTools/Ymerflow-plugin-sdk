@@ -287,6 +287,11 @@ class via `cluster_provider_handlers`.
   validating a token before even attempting a network call).
 - `bootstrap(provider_config: dict) -> dict` (sync) — **required**, no default. See [The
   `bootstrap()` provisioning flow](#the-bootstrap-provisioning-flow) below.
+- `supports_app_deployment` (class attribute, default `False`), `deploy_app(...)` /
+  `expose_app(...)` (async, optional) — the hook for a provider that can also **host the Nagelfluh
+  application itself** (backend + frontend pods, their config/secrets, their exposure) on its
+  cluster, not just run process/analysis Jobs on it. See [Hosting the app: `deploy_app()` /
+  `expose_app()`](#hosting-the-app-deploy_app--expose_app) below.
 
 ```python
 from backend.services.cluster_providers import ClusterProvider
@@ -346,6 +351,88 @@ job-running RBAC. This is generic, pure-`kubernetes_asyncio` logic that works ag
 returning a working `K8sClient` from `connect()`; it never needs to install Kueue or apply RBAC
 itself. See the host repo's `docs/architecture/registry.md` and
 `docs/plans/done/registry-backend-hooks.md` for the full design.
+
+#### Hosting the app: `deploy_app()` / `expose_app()`
+
+Everything above is about running **process/analysis Jobs** on a cluster. A `ClusterProvider` can
+*optionally* also host the **Nagelfluh application itself** — the backend + frontend pods, their
+workload-level config/secrets, the DB migration, and how external traffic reaches them — on the
+very same `Cluster` row job execution already resolves. There is no separate "which cluster hosts
+the app" model: app hosting always targets the same `Cluster` that `connect()` resolves (host
+repo's `docs/plans/app-deployment-hooks.md`, Design decision 1). This capability is gated behind a
+class flag and exposed through two optional async methods:
+
+- `supports_app_deployment` (class attribute, default `False`) — set `True` to declare this
+  cluster type can host the app. This gates whether the host ever calls `deploy_app()`/
+  `expose_app()` for the type, mirroring how `self_service_registration` gates the out-of-band
+  registration flow — a per-type capability flag that changes control flow with no router changes.
+  A provider that leaves it `False` (e.g. the generic `kubeconfig` bring-your-own type, which
+  can't auto-know its own Ingress class or intended exposure) is completely unaffected: the
+  operator deploys/exposes the app by hand via the host's `k8s/*.yaml`, exactly as before this hook
+  existed.
+- `deploy_app(k8s_client, provider_config, namespace, images, app_config, secrets) -> None`
+  (async) — apply the app's workload-level resources: the backend + frontend `Deployment`/
+  `Service`, the `nagelfluh-backend-config`/`nagelfluh-backend-secret` `ConfigMap`/`Secret`, and
+  the DB migration `Job`. This work is **identical for every provider**, so an implementation
+  delegates it to the shared host helper
+  `backend.services.app_deployment.apply_app_workloads(k8s_client, namespace, images, app_config,
+  secrets, image_pull_credentials=..., replicas=...)` — the same "shared utility, not part of the
+  ABC" shape as `ensure_cluster_job_ready()`. Your `deploy_app()`'s own job is only to resolve the
+  provider-specific inputs (e.g. how images are made pullable on this cluster) and call the helper.
+  `namespace` here is the **app** namespace (e.g. `nagelfluh`), distinct from `Cluster.namespace`
+  (the *jobs* namespace). `images` is `{"backend": ..., "frontend": ...}` of already-resolved
+  `RegistryProtocolHandler.image_url()` strings — app images go through the [registry
+  axis](#registry-hooks), never `imagePullPolicy: Never`. `secrets` must include a fully-resolved
+  `DATABASE_URL`; `JWT_SECRET_KEY` is handled inside the helper (check-before-generate against the
+  K8s API — reuse an existing Secret's value across redeploys so tokens stay valid, generate one
+  only on a first-ever deploy).
+- `expose_app(k8s_client, provider_config, namespace, app_config) -> dict` (async) — the
+  **genuinely provider-specific part**: how external traffic reaches the app and whether/how TLS is
+  terminated. Returns `{"url": str, ...}`. Core's `same-as-backend`/`minikube` implement it as a
+  NodePort `Service` (parameterized from `app_config`, e.g. `FRONTEND_NODE_PORT`/`SERVER_URL`); a
+  cloud cluster type implements it against whatever managed load balancer / certificate / Ingress
+  that cloud offers, reading `app_config["APP_DOMAIN"]` if it wants a hostname to request a
+  certificate for. The host threads `APP_DOMAIN` through unchanged and does not interpret it.
+
+Core ships two reference implementations of this, both via a shared
+`NodePortAppDeploymentMixin` (`backend/services/cluster_providers/nodeport_app_deployment.py`):
+`same-as-backend` and `minikube`. A plugin adding a cloud cluster type implements the same two
+methods for its own provider — the same relationship a plugin's `bootstrap()` has to the registry/
+storage/cluster axes: core defines the hook and a reference implementation, the plugin implements
+it for its cluster.
+
+```python
+from backend.services.cluster_providers import ClusterProvider
+from backend.services import app_deployment
+
+class GkeClusterProvider(ClusterProvider):
+    supports_app_deployment = True
+
+    def connect(self, provider_config, namespace):
+        ...
+
+    async def deploy_app(self, k8s_client, provider_config, namespace, images, app_config, secrets):
+        # Resolve the provider-specific bits (here: a pull credential for GAR-hosted app images),
+        # then delegate the identical workload-apply to the shared helper.
+        pull = await resolve_gar_pull_credentials(provider_config)
+        await app_deployment.apply_app_workloads(
+            k8s_client, namespace, images, app_config, secrets,
+            image_pull_credentials=pull,
+        )
+
+    async def expose_app(self, k8s_client, provider_config, namespace, app_config):
+        # The genuinely GKE-specific part: a managed LB + ManagedCertificate for APP_DOMAIN,
+        # rather than a NodePort. Returns the externally-reachable URL.
+        domain = app_config.get("APP_DOMAIN")
+        url = await ensure_gke_ingress_and_cert(k8s_client, namespace, domain)
+        return {"url": url}
+```
+
+The host resolves the default `Cluster`'s provider and calls these two methods from its
+`backend/bin/nagelfluh-deploy-app` orchestration entry point (run as an in-cluster Job in the
+prod-minikube flow). A plugin never invokes them itself — it only implements them; the host's
+entry point is the single call site. See the host repo's `docs/plans/app-deployment-hooks.md` for
+the full design.
 
 ## Storage hooks
 
